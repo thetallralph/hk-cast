@@ -2,150 +2,181 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>HK Diag</title>
+  <title>HK Diag v2</title>
 </head>
 <body>
   <script>
-    // All diagnostic results collected here
     const results = [];
-    function log(msg) {
-      results.push(msg);
-      document.title = 'HK:' + results.length;
-    }
-
-    // Send results back to us via ntfy.sh
     const TOPIC = 'hk-cast-diag-x7k9m2';
+
+    function log(msg) { results.push(msg); }
 
     async function sendResults() {
       try {
         await fetch(`https://ntfy.sh/${TOPIC}`, {
           method: 'POST',
-          body: JSON.stringify({ results, ts: Date.now() }),
+          body: JSON.stringify({ v: 2, results, ts: Date.now() }),
           headers: { 'Content-Type': 'application/json' }
         });
+        document.title = 'SENT:' + results.length;
       } catch (e) {
-        // fallback: encode in title
         document.title = 'ERR:' + e.message;
       }
     }
 
-    async function runDiagnostics() {
-      log('DIAG_START');
+    async function run() {
+      log('DIAG_V2_START');
       log('UA:' + navigator.userAgent);
-      log('Platform:' + navigator.platform);
 
-      // 1. getUserMedia support
-      const hasGUM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-      log('getUserMedia:' + hasGUM);
+      // Chrome version and features
+      log('chrome_ver:' + (/Chrome\/(\d+)/.exec(navigator.userAgent) || ['','?'])[1]);
 
-      // 2. enumerateDevices
+      // 1. Detailed mediaDevices check
+      log('mediaDevices:' + !!navigator.mediaDevices);
+      log('getUserMedia:' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+      log('enumerateDevices:' + !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices));
+
+      // Older getUserMedia APIs
+      log('webkitGetUserMedia:' + !!navigator.webkitGetUserMedia);
+      log('mozGetUserMedia:' + !!navigator.mozGetUserMedia);
+
+      // 2. Enumerate ALL devices with details
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
-        log('devices_total:' + devices.length);
         devices.forEach((d, i) => {
-          log(`dev${i}:${d.kind}|${d.label || 'nolabel'}|${d.deviceId.slice(0, 12)}`);
+          log(`device:${i}|${d.kind}|${d.label}|${d.deviceId}|${d.groupId}`);
         });
-        const mics = devices.filter(d => d.kind === 'audioinput');
-        log('mic_count:' + mics.length);
       } catch (e) {
-        log('enumerateDevices_err:' + e.name + ':' + e.message);
+        log('enum_err:' + e.name + ':' + e.message);
       }
 
-      // 3. Try microphone access
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        log('MIC_ACCESS:GRANTED');
-        const tracks = stream.getAudioTracks();
-        tracks.forEach((t, i) => {
-          const s = t.getSettings();
-          log(`track${i}:${t.label}|sr=${s.sampleRate}|ch=${s.channelCount}|enabled=${t.enabled}`);
-        });
+      // 3. Try getUserMedia with different constraints
+      const attempts = [
+        { audio: true },
+        { audio: {} },
+        { audio: { deviceId: 'default' } },
+        { audio: { echoCancellation: false } },
+        { audio: { sampleRate: 16000 } },
+        { audio: { channelCount: 1 } },
+      ];
 
-        // Audio level test (3 seconds)
+      for (let i = 0; i < attempts.length; i++) {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia(attempts[i]);
+          log(`gum_attempt${i}:SUCCESS`);
+          s.getTracks().forEach(t => {
+            log(`gum${i}_track:${t.kind}|${t.label}|${JSON.stringify(t.getSettings())}`);
+            t.stop();
+          });
+          break; // Stop on first success
+        } catch (e) {
+          log(`gum_attempt${i}:${e.name}:${e.message}`);
+        }
+      }
+
+      // 4. Try legacy getUserMedia
+      try {
+        if (navigator.webkitGetUserMedia) {
+          await new Promise((resolve, reject) => {
+            navigator.webkitGetUserMedia({ audio: true },
+              (s) => { log('webkit_gum:SUCCESS'); s.getTracks().forEach(t => t.stop()); resolve(); },
+              (e) => { log('webkit_gum:' + e.name + ':' + e.message); resolve(); }
+            );
+          });
+        }
+      } catch (e) {
+        log('webkit_gum_err:' + e.message);
+      }
+
+      // 5. Check Web Speech API (speech recognition)
+      log('SpeechRecognition:' + !!(window.SpeechRecognition || window.webkitSpeechRecognition));
+      if (window.SpeechRecognition || window.webkitSpeechRecognition) {
+        try {
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          const recognition = new SR();
+          recognition.lang = 'en-US';
+          recognition.continuous = false;
+          recognition.interimResults = false;
+
+          await new Promise((resolve) => {
+            recognition.onresult = (e) => {
+              log('speech_result:' + e.results[0][0].transcript);
+              resolve();
+            };
+            recognition.onerror = (e) => {
+              log('speech_err:' + e.error + ':' + e.message);
+              resolve();
+            };
+            recognition.onend = () => resolve();
+            recognition.start();
+            setTimeout(() => { try { recognition.stop(); } catch(e){} resolve(); }, 5000);
+          });
+        } catch (e) {
+          log('speech_api_err:' + e.name + ':' + e.message);
+        }
+      }
+
+      // 6. Check AudioWorklet support
+      try {
         const ctx = new AudioContext();
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        src.connect(analyser);
-        const data = new Uint8Array(analyser.frequencyBinCount);
+        log('audioContext:OK|sr=' + ctx.sampleRate + '|state=' + ctx.state);
+        log('audioWorklet:' + !!ctx.audioWorklet);
 
-        let maxLvl = 0;
-        await new Promise(resolve => {
-          let count = 0;
-          const iv = setInterval(() => {
-            analyser.getByteFrequencyData(data);
-            const avg = data.reduce((a, b) => a + b, 0) / data.length;
-            if (avg > maxLvl) maxLvl = avg;
-            log(`audio_lvl:${avg.toFixed(1)}`);
-            if (++count >= 6) { clearInterval(iv); resolve(); }
-          }, 500);
-        });
+        // Check audio destination details
+        log('audio_dest:channels=' + ctx.destination.maxChannelCount);
 
-        stream.getTracks().forEach(t => t.stop());
+        // Try createMediaStreamDestination
+        try {
+          const dest = ctx.createMediaStreamDestination();
+          log('mediaStreamDest:OK');
+        } catch(e) {
+          log('mediaStreamDest:' + e.message);
+        }
+
         ctx.close();
-        log('mic_max_level:' + maxLvl.toFixed(1));
-        log('MIC_WORKING:' + (maxLvl > 5));
       } catch (e) {
-        log('MIC_ACCESS:DENIED:' + e.name + ':' + e.message);
+        log('audioCtx_err:' + e.message);
       }
 
-      // 4. Network tests
+      // 7. Check permissions API
       try {
-        await fetch('https://api.anthropic.com/', { method: 'HEAD', mode: 'no-cors' });
-        log('net_anthropic:OK');
+        const micPerm = await navigator.permissions.query({ name: 'microphone' });
+        log('mic_permission:' + micPerm.state);
       } catch (e) {
-        log('net_anthropic:FAIL:' + e.message);
+        log('mic_permission_err:' + e.name + ':' + e.message);
       }
 
-      try {
-        await fetch('https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=test', { mode: 'no-cors' });
-        log('net_google_tts:OK');
-      } catch (e) {
-        log('net_google_tts:FAIL:' + e.message);
+      // 8. Check Bluetooth API
+      log('bluetooth_api:' + !!navigator.bluetooth);
+      if (navigator.bluetooth) {
+        try {
+          const avail = await navigator.bluetooth.getAvailability();
+          log('bluetooth_avail:' + avail);
+        } catch (e) {
+          log('bluetooth_err:' + e.message);
+        }
       }
 
-      // 5. Audio output test (beep)
-      try {
-        const ctx2 = new AudioContext();
-        const osc = ctx2.createOscillator();
-        const gain = ctx2.createGain();
-        osc.connect(gain);
-        gain.connect(ctx2.destination);
-        gain.gain.value = 0.05;
-        osc.frequency.value = 440;
-        osc.start();
-        await new Promise(r => setTimeout(r, 1000));
-        osc.stop();
-        ctx2.close();
-        log('audio_output:OK');
-      } catch (e) {
-        log('audio_output:FAIL:' + e.message);
+      // 9. Check USB API (WebUSB)
+      log('usb_api:' + !!navigator.usb);
+      if (navigator.usb) {
+        try {
+          const devices = await navigator.usb.getDevices();
+          log('usb_devices:' + devices.length);
+        } catch (e) {
+          log('usb_err:' + e.message);
+        }
       }
 
-      // 6. WebSocket test
-      try {
-        const ws = new WebSocket('wss://echo.websocket.org');
-        await new Promise((resolve, reject) => {
-          ws.onopen = () => { log('websocket:OK'); ws.close(); resolve(); };
-          ws.onerror = () => { log('websocket:FAIL'); reject(); };
-          setTimeout(() => { log('websocket:TIMEOUT'); reject(); }, 5000);
-        });
-      } catch (e) {
-        // already logged
-      }
+      // 10. Check if we're in secure context
+      log('isSecureContext:' + window.isSecureContext);
+      log('protocol:' + window.location.protocol);
 
-      log('DIAG_COMPLETE');
-      document.title = 'DONE:' + results.length + ' items';
-
-      // Send all results
+      log('DIAG_V2_COMPLETE');
       await sendResults();
     }
 
-    // DashCast loads us in an iframe — just run diagnostics immediately
-    window.addEventListener('load', () => {
-      // Small delay to ensure everything is ready
-      setTimeout(runDiagnostics, 1000);
-    });
+    window.addEventListener('load', () => setTimeout(run, 1500));
   </script>
 </body>
 </html>
