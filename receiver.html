@@ -18,33 +18,57 @@
     const MIC_PEER_ID = 'hk-mic-' + ROOM_ID;
 
     let conn = null;
+    const NTFY = 'hk-cast-diag-x7k9m2';
+
+    function dbg(msg) {
+      document.title = 'HK:' + msg.slice(0, 30);
+      fetch('https://ntfy.sh/' + NTFY, {
+        method: 'POST',
+        body: JSON.stringify({ src: 'receiver', msg, ts: Date.now() })
+      }).catch(() => {});
+    }
+
+    dbg('init:room=' + ROOM_ID + ',key=' + (GROQ_KEY ? 'yes(' + GROQ_KEY.length + ')' : 'NONE'));
 
     // === PEERJS SETUP ===
     const peer = new Peer(SPEAKER_PEER_ID, { debug: 0 });
 
-    peer.on('open', () => {
-      document.title = 'HK:ready:' + ROOM_ID;
+    peer.on('open', (id) => {
+      dbg('peer_open:' + id);
       connectToMic();
     });
 
+    peer.on('error', (err) => {
+      dbg('peer_error:' + err.type + ':' + err.message);
+    });
+
     peer.on('connection', (incoming) => {
+      dbg('incoming_connection');
       setupConnection(incoming);
     });
 
     function connectToMic() {
+      dbg('connecting_to_mic:' + MIC_PEER_ID);
       const c = peer.connect(MIC_PEER_ID, { reliable: true });
-      c.on('open', () => setupConnection(c));
-      c.on('error', () => {});
+      c.on('open', () => {
+        dbg('connected_to_mic');
+        setupConnection(c);
+      });
+      c.on('error', (e) => {
+        dbg('mic_connect_err:' + e);
+      });
     }
 
     function setupConnection(c) {
       conn = c;
+      dbg('data_channel_open');
       conn.on('data', async (data) => {
+        dbg('data_received:type=' + data.type + ',size=' + (data.data ? data.data.length : 0));
         if (data.type === 'audio') {
           await handleAudio(data.data);
         }
       });
-      conn.on('close', () => { conn = null; });
+      conn.on('close', () => { conn = null; dbg('conn_closed'); });
       sendToMic({ type: 'status', text: 'Connected! Hold button to talk.' });
     }
 
@@ -89,8 +113,8 @@
         document.title = 'HK:ready';
 
       } catch (err) {
+        dbg('ERROR:' + err.message);
         sendToMic({ type: 'status', text: 'Error: ' + err.message });
-        document.title = 'HK:error';
       }
     }
 
