@@ -17,10 +17,10 @@
       height: 100vh;
       padding: 20px;
     }
-    h2 { font-size: 18px; margin-bottom: 15px; color: #888; }
-    #status { font-size: 14px; color: #44aaff; margin: 10px 0; text-align: center; }
+    h2 { font-size: 18px; margin-bottom: 10px; color: #888; }
+    #status { font-size: 14px; color: #44aaff; margin: 10px 0; text-align: center; min-height: 20px; }
     #btn {
-      width: 140px; height: 140px;
+      width: 160px; height: 160px;
       border-radius: 50%;
       border: 4px solid #333;
       background: #2a2a4e;
@@ -33,7 +33,9 @@
       transition: all 0.2s;
       margin: 20px 0;
       -webkit-tap-highlight-color: transparent;
+      touch-action: none;
     }
+    #btn.ready { border-color: #00ff88; }
     #btn.listening {
       background: #ff4444;
       border-color: #ff6666;
@@ -43,6 +45,7 @@
       background: #ffaa00;
       border-color: #ffcc44;
     }
+    #btn.disabled { opacity: 0.5; }
     #level {
       width: 200px; height: 6px;
       background: #333;
@@ -50,46 +53,24 @@
       overflow: hidden;
       margin: 10px 0;
     }
-    #level-bar {
-      height: 100%; width: 0%;
-      background: #00ff88;
-      transition: width 0.1s;
-    }
-    #transcript {
-      font-size: 14px;
-      color: #aaa;
-      text-align: center;
-      margin-top: 15px;
-      max-width: 300px;
-      min-height: 40px;
-    }
-    #response {
-      font-size: 14px;
-      color: #00ff88;
-      text-align: center;
-      margin-top: 10px;
-      max-width: 300px;
-      min-height: 40px;
-    }
-    #room-id {
-      font-family: monospace;
-      font-size: 20px;
-      color: #ffaa00;
-      letter-spacing: 3px;
-      margin: 5px 0;
-    }
+    #level-bar { height: 100%; width: 0%; background: #00ff88; transition: width 0.1s; }
+    #transcript { font-size: 14px; color: #aaa; text-align: center; margin-top: 10px; max-width: 300px; }
+    #response { font-size: 14px; color: #00ff88; text-align: center; margin-top: 10px; max-width: 300px; }
+    #log { font-size: 11px; color: #555; margin-top: 20px; max-height: 100px; overflow-y: auto; text-align: center; }
+    #room-id { font-family: monospace; font-size: 20px; color: #ffaa00; letter-spacing: 3px; }
   </style>
 </head>
 <body>
-  <h2>HK Voice Assistant — Mic</h2>
-  <div id="room-id">----</div>
-  <div id="status">Connecting to speaker...</div>
+  <h2>HK Voice Assistant</h2>
+  <div id="room-id"></div>
+  <div id="status">Initializing...</div>
 
-  <button id="btn" ontouchstart="">Tap to talk</button>
+  <button id="btn" class="disabled">Loading...</button>
 
   <div id="level"><div id="level-bar"></div></div>
   <div id="transcript"></div>
   <div id="response"></div>
+  <div id="log"></div>
 
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script>
@@ -98,109 +79,150 @@
     const levelBar = document.getElementById('level-bar');
     const transcriptEl = document.getElementById('transcript');
     const responseEl = document.getElementById('response');
+    const logEl = document.getElementById('log');
     const roomIdEl = document.getElementById('room-id');
 
-    // Room ID from URL hash or default
     const ROOM_ID = location.hash.slice(1) || 'hk1000';
-    location.hash = ROOM_ID;
     roomIdEl.textContent = ROOM_ID;
 
     const MIC_PEER_ID = 'hk-mic-' + ROOM_ID;
     const SPEAKER_PEER_ID = 'hk-spk-' + ROOM_ID;
 
     let conn = null;
+    let stream = null;
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
-    let stream = null;
     let analyser = null;
     let animFrame = null;
+    let micReady = false;
+    let peerReady = false;
 
-    // Connect to PeerJS
-    const peer = new Peer(MIC_PEER_ID, { debug: 0 });
+    function dbg(msg) {
+      console.log(msg);
+      logEl.textContent = msg + '\n' + logEl.textContent;
+    }
 
-    peer.on('open', (id) => {
-      statusEl.textContent = 'Waiting for speaker to connect...';
-      connectToSpeaker();
-    });
-
-    peer.on('error', (err) => {
-      statusEl.textContent = 'Peer error: ' + err.type;
-      if (err.type === 'unavailable-id') {
-        // Already connected, retry with suffix
-        statusEl.textContent = 'Mic already connected elsewhere. Refresh.';
+    // === STEP 1: Setup mic immediately ===
+    async function setupMic() {
+      try {
+        dbg('Requesting mic access...');
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true }
+        });
+        const ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        src.connect(analyser);
+        micReady = true;
+        dbg('Mic OK');
+        updateButtonState();
+      } catch (e) {
+        dbg('Mic error: ' + e.message);
+        statusEl.textContent = 'Mic access denied! Check browser permissions.';
       }
-    });
+    }
 
-    function connectToSpeaker() {
-      conn = peer.connect(SPEAKER_PEER_ID, { reliable: true });
+    // === STEP 2: Connect PeerJS ===
+    function setupPeer() {
+      dbg('Connecting to PeerJS...');
+      const peer = new Peer(MIC_PEER_ID, { debug: 0 });
 
-      conn.on('open', () => {
-        statusEl.textContent = 'Connected to speaker!';
-        btn.style.borderColor = '#00ff88';
+      peer.on('open', (id) => {
+        dbg('Peer open: ' + id);
+        peerReady = true;
+        statusEl.textContent = 'Connecting to speaker...';
+        tryConnectToSpeaker(peer);
       });
 
-      conn.on('data', (data) => {
-        if (data.type === 'transcript') {
-          transcriptEl.textContent = '"' + data.text + '"';
-        } else if (data.type === 'response') {
-          responseEl.textContent = data.text;
-        } else if (data.type === 'status') {
-          statusEl.textContent = data.text;
+      peer.on('connection', (incoming) => {
+        dbg('Incoming connection from speaker');
+        setupConnection(incoming);
+      });
+
+      peer.on('error', (err) => {
+        dbg('Peer error: ' + err.type + ' ' + err.message);
+        if (err.type === 'unavailable-id') {
+          statusEl.textContent = 'Mic already open elsewhere. Close other tab.';
+        } else if (err.type === 'peer-unavailable') {
+          dbg('Speaker not found, retrying...');
+          setTimeout(() => tryConnectToSpeaker(peer), 3000);
         }
       });
 
-      conn.on('close', () => {
-        statusEl.textContent = 'Disconnected. Reconnecting...';
-        btn.style.borderColor = '#333';
-        setTimeout(connectToSpeaker, 2000);
-      });
-
-      conn.on('error', () => {
-        statusEl.textContent = 'Speaker not found. Retrying...';
-        setTimeout(connectToSpeaker, 3000);
+      peer.on('disconnected', () => {
+        dbg('Peer disconnected, reconnecting...');
+        peer.reconnect();
       });
     }
 
-    // Also accept incoming connections from speaker
-    peer.on('connection', (incoming) => {
-      conn = incoming;
-      conn.on('open', () => {
-        statusEl.textContent = 'Connected to speaker!';
-        btn.style.borderColor = '#00ff88';
+    function tryConnectToSpeaker(peer) {
+      dbg('Trying to connect to speaker: ' + SPEAKER_PEER_ID);
+      const c = peer.connect(SPEAKER_PEER_ID, { reliable: true });
+
+      c.on('open', () => {
+        dbg('Connected to speaker!');
+        setupConnection(c);
       });
+
+      c.on('error', (e) => {
+        dbg('Connection error: ' + e);
+        setTimeout(() => tryConnectToSpeaker(peer), 3000);
+      });
+
+      // Timeout fallback
+      setTimeout(() => {
+        if (!conn) {
+          dbg('Connection timeout, retrying...');
+          tryConnectToSpeaker(peer);
+        }
+      }, 8000);
+    }
+
+    function setupConnection(c) {
+      conn = c;
+      dbg('Data channel open');
+      statusEl.textContent = 'Connected to speaker!';
+      updateButtonState();
+
       conn.on('data', (data) => {
-        if (data.type === 'transcript') transcriptEl.textContent = '"' + data.text + '"';
-        else if (data.type === 'response') responseEl.textContent = data.text;
+        if (data.type === 'transcript') transcriptEl.textContent = '🎤 "' + data.text + '"';
+        else if (data.type === 'response') responseEl.textContent = '🔊 ' + data.text;
         else if (data.type === 'status') statusEl.textContent = data.text;
       });
-    });
 
-    // Mic setup
-    async function setupMic() {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+      conn.on('close', () => {
+        dbg('Connection closed');
+        conn = null;
+        statusEl.textContent = 'Disconnected. Reconnecting...';
+        updateButtonState();
       });
-      const ctx = new AudioContext();
-      const src = ctx.createMediaStreamSource(stream);
-      analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      src.connect(analyser);
     }
 
-    function updateLevel() {
-      if (!analyser) return;
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(data);
-      const avg = data.reduce((a, b) => a + b, 0) / data.length;
-      levelBar.style.width = Math.min(100, avg * 1.5) + '%';
-      if (isRecording) animFrame = requestAnimationFrame(updateLevel);
+    function updateButtonState() {
+      btn.classList.remove('disabled', 'ready');
+      if (micReady && conn) {
+        btn.classList.add('ready');
+        btn.textContent = 'Hold to talk';
+        statusEl.textContent = 'Ready! Hold the button and speak.';
+      } else if (micReady && !conn) {
+        btn.textContent = 'Waiting for speaker...';
+      } else {
+        btn.classList.add('disabled');
+        btn.textContent = 'Setting up...';
+      }
     }
 
+    // === RECORDING ===
     function startRecording() {
-      if (!stream) return;
+      if (!micReady || !stream || !conn) {
+        dbg('Cannot record: mic=' + micReady + ' conn=' + !!conn);
+        return;
+      }
       isRecording = true;
       audioChunks = [];
+      btn.classList.remove('ready');
       btn.classList.add('listening');
       btn.textContent = 'Listening...';
       transcriptEl.textContent = '';
@@ -211,7 +233,7 @@
         if (e.data.size > 0) audioChunks.push(e.data);
       };
       mediaRecorder.onstop = sendAudio;
-      mediaRecorder.start(100); // chunks every 100ms
+      mediaRecorder.start(100);
       updateLevel();
     }
 
@@ -228,38 +250,73 @@
       }
     }
 
+    function updateLevel() {
+      if (!analyser || !isRecording) return;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      levelBar.style.width = Math.min(100, avg * 1.5) + '%';
+      animFrame = requestAnimationFrame(updateLevel);
+    }
+
     async function sendAudio() {
       const blob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
-      // Convert to base64 and send via PeerJS data channel
+      dbg('Audio size: ' + blob.size + ' bytes');
+
+      if (blob.size < 1000) {
+        dbg('Audio too short, ignoring');
+        btn.classList.remove('processing');
+        updateButtonState();
+        return;
+      }
+
       const buffer = await blob.arrayBuffer();
       const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
 
       if (conn && conn.open) {
-        conn.send({ type: 'audio', data: base64, format: 'webm-opus' });
+        conn.send({ type: 'audio', data: base64 });
+        dbg('Audio sent (' + base64.length + ' chars)');
         statusEl.textContent = 'Audio sent to speaker...';
       } else {
+        dbg('Not connected!');
         statusEl.textContent = 'Not connected to speaker!';
       }
 
       btn.classList.remove('processing');
-      btn.textContent = 'Tap to talk';
+      updateButtonState();
     }
 
-    // Button handlers (touch + mouse)
-    btn.addEventListener('mousedown', (e) => { e.preventDefault(); startRecording(); });
-    btn.addEventListener('mouseup', (e) => { e.preventDefault(); stopRecording(); });
-    btn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
-    btn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+    // === BUTTON EVENTS ===
+    let touchActive = false;
 
-    // Init mic on first interaction
-    let micReady = false;
-    btn.addEventListener('click', async () => {
-      if (!micReady) {
-        await setupMic();
-        micReady = true;
-        statusEl.textContent = conn && conn.open ? 'Connected! Hold button to talk.' : 'Mic ready. Waiting for speaker...';
-      }
-    }, { once: true });
+    btn.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      touchActive = true;
+      startRecording();
+    }, { passive: false });
+
+    btn.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      touchActive = false;
+      stopRecording();
+    }, { passive: false });
+
+    btn.addEventListener('touchcancel', (e) => {
+      touchActive = false;
+      stopRecording();
+    });
+
+    btn.addEventListener('mousedown', (e) => {
+      if (!touchActive) { e.preventDefault(); startRecording(); }
+    });
+
+    btn.addEventListener('mouseup', (e) => {
+      if (!touchActive) { e.preventDefault(); stopRecording(); }
+    });
+
+    // === INIT ===
+    setupMic();
+    setupPeer();
   </script>
 </body>
 </html>
