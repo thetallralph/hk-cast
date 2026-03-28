@@ -79,41 +79,40 @@
     // === AUDIO PROCESSING ===
     async function handleAudio(base64Audio) {
       sendToMic({ type: 'status', text: 'Transcribing...' });
-      document.title = 'HK:transcribing';
 
       try {
-        // 1. Decode base64 to blob
+        dbg('step1:decoding_base64:' + base64Audio.length);
         const bin = atob(base64Audio);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const audioBlob = new Blob([bytes], { type: 'audio/webm;codecs=opus' });
+        dbg('step2:blob_created:' + audioBlob.size + 'bytes');
 
-        // 2. STT via Groq Whisper
+        dbg('step3:calling_whisper');
         const transcript = await transcribe(audioBlob);
+        dbg('step4:transcript=' + (transcript || 'EMPTY'));
         if (!transcript) {
           sendToMic({ type: 'status', text: 'Could not hear you. Try again.' });
-          document.title = 'HK:ready';
           return;
         }
 
         sendToMic({ type: 'transcript', text: transcript });
         sendToMic({ type: 'status', text: 'Thinking...' });
-        document.title = 'HK:thinking';
 
-        // 3. LLM via Groq
+        dbg('step5:calling_llm');
         const response = await chat(transcript);
+        dbg('step6:response=' + response.slice(0, 80));
         sendToMic({ type: 'response', text: response.slice(0, 200) });
         sendToMic({ type: 'status', text: 'Speaking...' });
-        document.title = 'HK:speaking';
 
-        // 4. TTS and play
+        dbg('step7:playing_tts');
         await speak(response);
+        dbg('step8:done');
 
         sendToMic({ type: 'status', text: 'Ready. Hold button to talk.' });
-        document.title = 'HK:ready';
 
       } catch (err) {
-        dbg('ERROR:' + err.message);
+        dbg('ERROR:' + err.name + ':' + err.message);
         sendToMic({ type: 'status', text: 'Error: ' + err.message });
       }
     }
