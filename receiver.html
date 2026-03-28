@@ -66,6 +66,8 @@
         dbg('data_received:type=' + data.type + ',size=' + (data.data ? data.data.length : 0));
         if (data.type === 'audio') {
           await handleAudio(data.data);
+        } else if (data.type === 'tts_audio') {
+          await playTTSAudio(data.data);
         }
       });
       conn.on('close', () => { conn = null; dbg('conn_closed'); });
@@ -200,56 +202,41 @@
       return parts;
     }
 
+    // Ask the phone to fetch TTS and send audio back
+    let ttsResolve = null;
+
     async function playChunk(text) {
-      // Method 1: Try Groq TTS (playai-tts)
+      dbg('tts_request_to_phone:' + text.length + 'chars');
+      sendToMic({ type: 'tts_request', text });
+
+      // Wait for phone to send back audio data
+      return new Promise((resolve) => {
+        ttsResolve = resolve;
+        setTimeout(() => { dbg('tts_timeout'); resolve(); }, 15000);
+      });
+    }
+
+    // Called when phone sends back TTS audio
+    async function playTTSAudio(base64Audio) {
       try {
-        const r = await fetch('https://api.groq.com/openai/v1/audio/speech', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + GROQ_KEY
-          },
-          body: JSON.stringify({
-            model: 'playai-tts',
-            input: text,
-            voice: 'Arista-PlayAI',
-            response_format: 'wav'
-          })
-        });
+        const bin = atob(base64Audio);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
-        if (!r.ok) throw new Error('Groq TTS: ' + r.status);
-
-        const arrayBuf = await r.arrayBuffer();
-        dbg('groq_tts_ok:' + arrayBuf.byteLength + 'bytes');
-
-        const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+        const audioBuf = await audioCtx.decodeAudioData(bytes.buffer);
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuf;
         source.connect(audioCtx.destination);
 
-        return new Promise((resolve) => {
-          source.onended = resolve;
-          source.start(0);
-        });
+        source.onended = () => {
+          dbg('tts_chunk_played');
+          if (ttsResolve) { ttsResolve(); ttsResolve = null; }
+        };
+        source.start(0);
       } catch (e) {
-        dbg('groq_tts_err:' + e.message);
+        dbg('tts_play_err:' + e.message);
+        if (ttsResolve) { ttsResolve(); ttsResolve = null; }
       }
-
-      // Method 2: Try speechSynthesis (browser built-in)
-      if (window.speechSynthesis) {
-        dbg('trying_speechSynthesis');
-        return new Promise((resolve) => {
-          const utt = new SpeechSynthesisUtterance(text);
-          utt.lang = 'fr-FR';
-          utt.rate = 1.0;
-          utt.onend = resolve;
-          utt.onerror = () => resolve();
-          speechSynthesis.speak(utt);
-          setTimeout(resolve, 15000);
-        });
-      }
-
-      dbg('no_tts_available');
     }
   </script>
 </body>
