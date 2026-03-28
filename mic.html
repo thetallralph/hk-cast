@@ -100,8 +100,8 @@
     const responseEl = document.getElementById('response');
     const roomIdEl = document.getElementById('room-id');
 
-    // Room ID from URL hash or generate one
-    const ROOM_ID = location.hash.slice(1) || Math.random().toString(36).slice(2, 8);
+    // Room ID from URL hash or default
+    const ROOM_ID = location.hash.slice(1) || 'hk1000';
     location.hash = ROOM_ID;
     roomIdEl.textContent = ROOM_ID;
 
