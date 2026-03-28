@@ -201,14 +201,26 @@
     }
 
     async function playChunk(text) {
-      const url = 'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=fr&q=' + encodeURIComponent(text);
-
+      // Method 1: Try Groq TTS (playai-tts)
       try {
-        // Fetch audio data and play via Web Audio API (bypasses autoplay restrictions)
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('TTS fetch: ' + response.status);
-        const arrayBuf = await response.arrayBuffer();
-        dbg('tts_fetched:' + arrayBuf.byteLength + 'bytes');
+        const r = await fetch('https://api.groq.com/openai/v1/audio/speech', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + GROQ_KEY
+          },
+          body: JSON.stringify({
+            model: 'playai-tts',
+            input: text,
+            voice: 'Arista-PlayAI',
+            response_format: 'wav'
+          })
+        });
+
+        if (!r.ok) throw new Error('Groq TTS: ' + r.status);
+
+        const arrayBuf = await r.arrayBuffer();
+        dbg('groq_tts_ok:' + arrayBuf.byteLength + 'bytes');
 
         const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
         const source = audioCtx.createBufferSource();
@@ -220,21 +232,24 @@
           source.start(0);
         });
       } catch (e) {
-        dbg('tts_error:' + e.name + ':' + e.message);
-
-        // Fallback: try with Audio element anyway
-        try {
-          await new Promise((resolve) => {
-            const audio = new Audio(url);
-            audio.onended = resolve;
-            audio.onerror = () => resolve();
-            audio.play().catch(() => resolve());
-            setTimeout(resolve, 5000); // safety timeout
-          });
-        } catch (e2) {
-          dbg('tts_fallback_error:' + e2.message);
-        }
+        dbg('groq_tts_err:' + e.message);
       }
+
+      // Method 2: Try speechSynthesis (browser built-in)
+      if (window.speechSynthesis) {
+        dbg('trying_speechSynthesis');
+        return new Promise((resolve) => {
+          const utt = new SpeechSynthesisUtterance(text);
+          utt.lang = 'fr-FR';
+          utt.rate = 1.0;
+          utt.onend = resolve;
+          utt.onerror = () => resolve();
+          speechSynthesis.speak(utt);
+          setTimeout(resolve, 15000);
+        });
+      }
+
+      dbg('no_tts_available');
     }
   </script>
 </body>
