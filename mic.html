@@ -187,10 +187,14 @@
       updateButtonState();
 
       conn.on('data', async (data) => {
+        dbg('From speaker: ' + data.type);
         if (data.type === 'transcript') transcriptEl.textContent = '🎤 "' + data.text + '"';
         else if (data.type === 'response') responseEl.textContent = '🔊 ' + data.text;
         else if (data.type === 'status') statusEl.textContent = data.text;
-        else if (data.type === 'tts_request') await handleTTSRequest(data.text);
+        else if (data.type === 'tts_request') {
+          dbg('TTS request received: ' + data.text.slice(0, 30));
+          await handleTTSRequest(data.text);
+        }
       });
 
       conn.on('close', () => {
@@ -317,23 +321,38 @@
 
     // === TTS RELAY: fetch Google TTS and send audio back to speaker ===
     async function handleTTSRequest(text) {
-      dbg('TTS relay: ' + text.slice(0, 40) + '...');
+      dbg('TTS relay start: ' + text.slice(0, 40));
       statusEl.textContent = 'Speaking...';
 
       try {
         const url = 'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=fr&q=' + encodeURIComponent(text);
+        dbg('Fetching TTS: ' + url.slice(0, 80));
         const response = await fetch(url);
+        dbg('TTS response: ' + response.status);
         if (!response.ok) throw new Error('TTS fetch: ' + response.status);
 
         const arrayBuf = await response.arrayBuffer();
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
-        dbg('TTS fetched: ' + arrayBuf.byteLength + ' bytes, sending to speaker');
+        dbg('TTS audio: ' + arrayBuf.byteLength + ' bytes');
 
+        // Convert to base64
+        const bytes = new Uint8Array(arrayBuf);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const base64 = btoa(binary);
+
+        dbg('Sending TTS audio to speaker: ' + base64.length + ' chars');
         if (conn && conn.open) {
           conn.send({ type: 'tts_audio', data: base64 });
+          dbg('TTS audio sent!');
+        } else {
+          dbg('ERROR: conn not open!');
         }
       } catch (e) {
         dbg('TTS relay error: ' + e.message);
+        // Fallback: play on phone speaker directly
+        dbg('Fallback: playing on phone');
+        const audio = new Audio('https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=fr&q=' + encodeURIComponent(text));
+        audio.play().catch(() => {});
       }
     }
 

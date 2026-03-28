@@ -34,30 +34,18 @@
     const peer = new Peer(SPEAKER_PEER_ID, { debug: 0 });
 
     peer.on('open', (id) => {
-      dbg('peer_open:' + id);
-      connectToMic();
+      dbg('peer_open:' + id + ':waiting_for_mic');
     });
 
     peer.on('error', (err) => {
       dbg('peer_error:' + err.type + ':' + err.message);
     });
 
+    // Only accept incoming connections from mic (no outgoing)
     peer.on('connection', (incoming) => {
-      dbg('incoming_connection');
+      dbg('incoming_connection_from_mic');
       setupConnection(incoming);
     });
-
-    function connectToMic() {
-      dbg('connecting_to_mic:' + MIC_PEER_ID);
-      const c = peer.connect(MIC_PEER_ID, { reliable: true });
-      c.on('open', () => {
-        dbg('connected_to_mic');
-        setupConnection(c);
-      });
-      c.on('error', (e) => {
-        dbg('mic_connect_err:' + e);
-      });
-    }
 
     function setupConnection(c) {
       conn = c;
