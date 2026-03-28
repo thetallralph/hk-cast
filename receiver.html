@@ -2,181 +2,263 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>HK Diag v2</title>
+  <title>HK AI</title>
 </head>
 <body>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script>
-    const results = [];
-    const TOPIC = 'hk-cast-diag-x7k9m2';
+    // === CONFIG ===
+    // API key is set via URL hash: receiver.html#ROOM_ID:API_KEY
+    const hashParts = location.hash.slice(1).split(':');
+    const ROOM_ID = hashParts[0] || 'default';
+    const API_KEY = hashParts.slice(1).join(':') || '';
 
-    function log(msg) { results.push(msg); }
+    const SPEAKER_PEER_ID = 'hk-spk-' + ROOM_ID;
+    const MIC_PEER_ID = 'hk-mic-' + ROOM_ID;
 
-    async function sendResults() {
+    let conn = null;
+
+    // === PEERJS SETUP ===
+    const peer = new Peer(SPEAKER_PEER_ID, { debug: 0 });
+
+    peer.on('open', () => {
+      document.title = 'HK:ready:' + ROOM_ID;
+      log('Speaker peer ready: ' + SPEAKER_PEER_ID);
+      connectToMic();
+    });
+
+    peer.on('connection', (incoming) => {
+      log('Mic connected (incoming)');
+      setupConnection(incoming);
+    });
+
+    function connectToMic() {
+      const c = peer.connect(MIC_PEER_ID, { reliable: true });
+      c.on('open', () => {
+        log('Connected to mic (outgoing)');
+        setupConnection(c);
+      });
+      c.on('error', () => {
+        log('Mic not found, waiting for incoming...');
+      });
+    }
+
+    function setupConnection(c) {
+      conn = c;
+      conn.on('data', async (data) => {
+        if (data.type === 'audio') {
+          await handleAudio(data.data, data.format);
+        }
+      });
+      conn.on('close', () => {
+        log('Mic disconnected');
+        conn = null;
+      });
+      sendToMic({ type: 'status', text: 'Connected! Hold button to talk.' });
+    }
+
+    function sendToMic(data) {
+      if (conn && conn.open) conn.send(data);
+    }
+
+    function log(msg) {
+      console.log('[HK]', msg);
+    }
+
+    // === AUDIO PROCESSING ===
+    async function handleAudio(base64Audio, format) {
+      sendToMic({ type: 'status', text: 'Transcribing...' });
+      document.title = 'HK:transcribing';
+
       try {
-        await fetch(`https://ntfy.sh/${TOPIC}`, {
+        // 1. Convert base64 to blob
+        const binaryStr = atob(base64Audio);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+        const audioBlob = new Blob([bytes], { type: 'audio/webm;codecs=opus' });
+
+        // 2. Transcribe with Whisper API (via proxy or direct)
+        const transcript = await transcribeAudio(audioBlob);
+        if (!transcript) {
+          sendToMic({ type: 'status', text: 'Could not transcribe audio.' });
+          return;
+        }
+
+        log('Transcript: ' + transcript);
+        sendToMic({ type: 'transcript', text: transcript });
+        sendToMic({ type: 'status', text: 'Thinking...' });
+        document.title = 'HK:thinking';
+
+        // 3. Send to Claude
+        const response = await askClaude(transcript);
+        log('Claude: ' + response);
+        sendToMic({ type: 'response', text: response.slice(0, 200) });
+        sendToMic({ type: 'status', text: 'Speaking...' });
+        document.title = 'HK:speaking';
+
+        // 4. TTS and play
+        await speakResponse(response);
+
+        sendToMic({ type: 'status', text: 'Ready. Hold button to talk.' });
+        document.title = 'HK:ready';
+
+      } catch (err) {
+        log('Error: ' + err.message);
+        sendToMic({ type: 'status', text: 'Error: ' + err.message });
+        document.title = 'HK:error';
+      }
+    }
+
+    // === STT: Use Groq Whisper (free tier) or OpenAI Whisper ===
+    async function transcribeAudio(audioBlob) {
+      // Option 1: Use Groq's free Whisper API
+      // Option 2: Use OpenAI Whisper
+      // For now, use a simple approach: Google Speech Recognition via Web Speech API
+      // Since Web Speech is not available on CrKey, we'll use Groq
+
+      if (!API_KEY) {
+        // Fallback: use a simple keyword detection or skip STT
+        log('No API key, cannot transcribe');
+        sendToMic({ type: 'status', text: 'No API key configured!' });
+        return null;
+      }
+
+      // Try Anthropic's approach: send audio as base64 in the Claude message
+      // Claude can't process audio directly, so we need a separate STT service
+      // Use Groq's free Whisper API as STT
+      try {
+        const formData = new FormData();
+        formData.append('file', audioBlob, 'audio.webm');
+        formData.append('model', 'whisper-large-v3');
+        formData.append('response_format', 'text');
+        formData.append('language', 'fr');
+
+        const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
           method: 'POST',
-          body: JSON.stringify({ v: 2, results, ts: Date.now() }),
-          headers: { 'Content-Type': 'application/json' }
+          headers: { 'Authorization': 'Bearer ' + API_KEY.split(',')[1] },
+          body: formData
         });
-        document.title = 'SENT:' + results.length;
+
+        if (!r.ok) {
+          const err = await r.text();
+          log('Groq STT error: ' + err);
+          // Fallback: try OpenAI-compatible endpoint
+          return null;
+        }
+
+        return (await r.text()).trim();
       } catch (e) {
-        document.title = 'ERR:' + e.message;
+        log('STT error: ' + e.message);
+        return null;
       }
     }
 
-    async function run() {
-      log('DIAG_V2_START');
-      log('UA:' + navigator.userAgent);
+    // === CLAUDE API ===
+    const conversationHistory = [];
 
-      // Chrome version and features
-      log('chrome_ver:' + (/Chrome\/(\d+)/.exec(navigator.userAgent) || ['','?'])[1]);
+    async function askClaude(userMessage) {
+      conversationHistory.push({ role: 'user', content: userMessage });
 
-      // 1. Detailed mediaDevices check
-      log('mediaDevices:' + !!navigator.mediaDevices);
-      log('getUserMedia:' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
-      log('enumerateDevices:' + !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices));
-
-      // Older getUserMedia APIs
-      log('webkitGetUserMedia:' + !!navigator.webkitGetUserMedia);
-      log('mozGetUserMedia:' + !!navigator.mozGetUserMedia);
-
-      // 2. Enumerate ALL devices with details
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        devices.forEach((d, i) => {
-          log(`device:${i}|${d.kind}|${d.label}|${d.deviceId}|${d.groupId}`);
-        });
-      } catch (e) {
-        log('enum_err:' + e.name + ':' + e.message);
+      // Keep last 10 messages for context
+      if (conversationHistory.length > 20) {
+        conversationHistory.splice(0, conversationHistory.length - 20);
       }
 
-      // 3. Try getUserMedia with different constraints
-      const attempts = [
-        { audio: true },
-        { audio: {} },
-        { audio: { deviceId: 'default' } },
-        { audio: { echoCancellation: false } },
-        { audio: { sampleRate: 16000 } },
-        { audio: { channelCount: 1 } },
-      ];
+      const anthropicKey = API_KEY.split(',')[0];
 
-      for (let i = 0; i < attempts.length; i++) {
-        try {
-          const s = await navigator.mediaDevices.getUserMedia(attempts[i]);
-          log(`gum_attempt${i}:SUCCESS`);
-          s.getTracks().forEach(t => {
-            log(`gum${i}_track:${t.kind}|${t.label}|${JSON.stringify(t.getSettings())}`);
-            t.stop();
-          });
-          break; // Stop on first success
-        } catch (e) {
-          log(`gum_attempt${i}:${e.name}:${e.message}`);
-        }
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 300,
+          system: "Tu es un assistant vocal intelligent qui parle à travers un speaker Harman Kardon Citation 1000 dans le bureau de KoinKoin Office à Cotonou, Bénin. Tu réponds de manière concise et naturelle, en français. Tes réponses seront lues à voix haute, donc garde-les courtes (2-3 phrases max).",
+          messages: conversationHistory
+        })
+      });
+
+      if (!r.ok) {
+        const err = await r.text();
+        throw new Error('Claude API: ' + r.status + ' ' + err.slice(0, 200));
       }
 
-      // 4. Try legacy getUserMedia
-      try {
-        if (navigator.webkitGetUserMedia) {
-          await new Promise((resolve, reject) => {
-            navigator.webkitGetUserMedia({ audio: true },
-              (s) => { log('webkit_gum:SUCCESS'); s.getTracks().forEach(t => t.stop()); resolve(); },
-              (e) => { log('webkit_gum:' + e.name + ':' + e.message); resolve(); }
-            );
-          });
-        }
-      } catch (e) {
-        log('webkit_gum_err:' + e.message);
-      }
-
-      // 5. Check Web Speech API (speech recognition)
-      log('SpeechRecognition:' + !!(window.SpeechRecognition || window.webkitSpeechRecognition));
-      if (window.SpeechRecognition || window.webkitSpeechRecognition) {
-        try {
-          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-          const recognition = new SR();
-          recognition.lang = 'en-US';
-          recognition.continuous = false;
-          recognition.interimResults = false;
-
-          await new Promise((resolve) => {
-            recognition.onresult = (e) => {
-              log('speech_result:' + e.results[0][0].transcript);
-              resolve();
-            };
-            recognition.onerror = (e) => {
-              log('speech_err:' + e.error + ':' + e.message);
-              resolve();
-            };
-            recognition.onend = () => resolve();
-            recognition.start();
-            setTimeout(() => { try { recognition.stop(); } catch(e){} resolve(); }, 5000);
-          });
-        } catch (e) {
-          log('speech_api_err:' + e.name + ':' + e.message);
-        }
-      }
-
-      // 6. Check AudioWorklet support
-      try {
-        const ctx = new AudioContext();
-        log('audioContext:OK|sr=' + ctx.sampleRate + '|state=' + ctx.state);
-        log('audioWorklet:' + !!ctx.audioWorklet);
-
-        // Check audio destination details
-        log('audio_dest:channels=' + ctx.destination.maxChannelCount);
-
-        // Try createMediaStreamDestination
-        try {
-          const dest = ctx.createMediaStreamDestination();
-          log('mediaStreamDest:OK');
-        } catch(e) {
-          log('mediaStreamDest:' + e.message);
-        }
-
-        ctx.close();
-      } catch (e) {
-        log('audioCtx_err:' + e.message);
-      }
-
-      // 7. Check permissions API
-      try {
-        const micPerm = await navigator.permissions.query({ name: 'microphone' });
-        log('mic_permission:' + micPerm.state);
-      } catch (e) {
-        log('mic_permission_err:' + e.name + ':' + e.message);
-      }
-
-      // 8. Check Bluetooth API
-      log('bluetooth_api:' + !!navigator.bluetooth);
-      if (navigator.bluetooth) {
-        try {
-          const avail = await navigator.bluetooth.getAvailability();
-          log('bluetooth_avail:' + avail);
-        } catch (e) {
-          log('bluetooth_err:' + e.message);
-        }
-      }
-
-      // 9. Check USB API (WebUSB)
-      log('usb_api:' + !!navigator.usb);
-      if (navigator.usb) {
-        try {
-          const devices = await navigator.usb.getDevices();
-          log('usb_devices:' + devices.length);
-        } catch (e) {
-          log('usb_err:' + e.message);
-        }
-      }
-
-      // 10. Check if we're in secure context
-      log('isSecureContext:' + window.isSecureContext);
-      log('protocol:' + window.location.protocol);
-
-      log('DIAG_V2_COMPLETE');
-      await sendResults();
+      const data = await r.json();
+      const reply = data.content[0].text;
+      conversationHistory.push({ role: 'assistant', content: reply });
+      return reply;
     }
 
-    window.addEventListener('load', () => setTimeout(run, 1500));
+    // === TTS: Google Translate TTS ===
+    async function speakResponse(text) {
+      // Split long text into chunks (Google TTS limit ~200 chars)
+      const chunks = splitText(text, 190);
+
+      for (const chunk of chunks) {
+        await playTTSChunk(chunk);
+      }
+    }
+
+    function splitText(text, maxLen) {
+      const chunks = [];
+      let remaining = text;
+      while (remaining.length > 0) {
+        if (remaining.length <= maxLen) {
+          chunks.push(remaining);
+          break;
+        }
+        // Find last sentence break before maxLen
+        let splitAt = remaining.lastIndexOf('. ', maxLen);
+        if (splitAt === -1 || splitAt < maxLen / 2) {
+          splitAt = remaining.lastIndexOf(' ', maxLen);
+        }
+        if (splitAt === -1) splitAt = maxLen;
+        chunks.push(remaining.slice(0, splitAt + 1).trim());
+        remaining = remaining.slice(splitAt + 1).trim();
+      }
+      return chunks;
+    }
+
+    function playTTSChunk(text) {
+      return new Promise((resolve, reject) => {
+        const encoded = encodeURIComponent(text);
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=fr&q=${encoded}`;
+
+        const audio = new Audio(url);
+        audio.onended = resolve;
+        audio.onerror = (e) => {
+          log('TTS playback error, trying fallback');
+          // Fallback: use SpeechSynthesis if available
+          if (window.speechSynthesis) {
+            const utt = new SpeechSynthesisUtterance(text);
+            utt.lang = 'fr-FR';
+            utt.onend = resolve;
+            utt.onerror = resolve;
+            speechSynthesis.speak(utt);
+          } else {
+            resolve();
+          }
+        };
+        audio.play().catch(() => resolve());
+      });
+    }
+
+    // === NOTIFY RESULTS ===
+    // Also send startup info to ntfy for debugging
+    fetch('https://ntfy.sh/hk-cast-diag-x7k9m2', {
+      method: 'POST',
+      body: JSON.stringify({
+        event: 'receiver_start',
+        room: ROOM_ID,
+        hasKey: !!API_KEY,
+        ua: navigator.userAgent,
+        ts: Date.now()
+      })
+    }).catch(() => {});
   </script>
 </body>
 </html>

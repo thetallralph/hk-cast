@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>HK Mic</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      padding: 20px;
+    }
+    h2 { font-size: 18px; margin-bottom: 15px; color: #888; }
+    #status { font-size: 14px; color: #44aaff; margin: 10px 0; text-align: center; }
+    #btn {
+      width: 140px; height: 140px;
+      border-radius: 50%;
+      border: 4px solid #333;
+      background: #2a2a4e;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+      margin: 20px 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #btn.listening {
+      background: #ff4444;
+      border-color: #ff6666;
+      box-shadow: 0 0 30px rgba(255,68,68,0.4);
+    }
+    #btn.processing {
+      background: #ffaa00;
+      border-color: #ffcc44;
+    }
+    #level {
+      width: 200px; height: 6px;
+      background: #333;
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 10px 0;
+    }
+    #level-bar {
+      height: 100%; width: 0%;
+      background: #00ff88;
+      transition: width 0.1s;
+    }
+    #transcript {
+      font-size: 14px;
+      color: #aaa;
+      text-align: center;
+      margin-top: 15px;
+      max-width: 300px;
+      min-height: 40px;
+    }
+    #response {
+      font-size: 14px;
+      color: #00ff88;
+      text-align: center;
+      margin-top: 10px;
+      max-width: 300px;
+      min-height: 40px;
+    }
+    #room-id {
+      font-family: monospace;
+      font-size: 20px;
+      color: #ffaa00;
+      letter-spacing: 3px;
+      margin: 5px 0;
+    }
+  </style>
+</head>
+<body>
+  <h2>HK Voice Assistant — Mic</h2>
+  <div id="room-id">----</div>
+  <div id="status">Connecting to speaker...</div>
+
+  <button id="btn" ontouchstart="">Tap to talk</button>
+
+  <div id="level"><div id="level-bar"></div></div>
+  <div id="transcript"></div>
+  <div id="response"></div>
+
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script>
+    const btn = document.getElementById('btn');
+    const statusEl = document.getElementById('status');
+    const levelBar = document.getElementById('level-bar');
+    const transcriptEl = document.getElementById('transcript');
+    const responseEl = document.getElementById('response');
+    const roomIdEl = document.getElementById('room-id');
+
+    // Room ID from URL hash or generate one
+    const ROOM_ID = location.hash.slice(1) || Math.random().toString(36).slice(2, 8);
+    location.hash = ROOM_ID;
+    roomIdEl.textContent = ROOM_ID;
+
+    const MIC_PEER_ID = 'hk-mic-' + ROOM_ID;
+    const SPEAKER_PEER_ID = 'hk-spk-' + ROOM_ID;
+
+    let conn = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    let stream = null;
+    let analyser = null;
+    let animFrame = null;
+
+    // Connect to PeerJS
+    const peer = new Peer(MIC_PEER_ID, { debug: 0 });
+
+    peer.on('open', (id) => {
+      statusEl.textContent = 'Waiting for speaker to connect...';
+      connectToSpeaker();
+    });
+
+    peer.on('error', (err) => {
+      statusEl.textContent = 'Peer error: ' + err.type;
+      if (err.type === 'unavailable-id') {
+        // Already connected, retry with suffix
+        statusEl.textContent = 'Mic already connected elsewhere. Refresh.';
+      }
+    });
+
+    function connectToSpeaker() {
+      conn = peer.connect(SPEAKER_PEER_ID, { reliable: true });
+
+      conn.on('open', () => {
+        statusEl.textContent = 'Connected to speaker!';
+        btn.style.borderColor = '#00ff88';
+      });
+
+      conn.on('data', (data) => {
+        if (data.type === 'transcript') {
+          transcriptEl.textContent = '"' + data.text + '"';
+        } else if (data.type === 'response') {
+          responseEl.textContent = data.text;
+        } else if (data.type === 'status') {
+          statusEl.textContent = data.text;
+        }
+      });
+
+      conn.on('close', () => {
+        statusEl.textContent = 'Disconnected. Reconnecting...';
+        btn.style.borderColor = '#333';
+        setTimeout(connectToSpeaker, 2000);
+      });
+
+      conn.on('error', () => {
+        statusEl.textContent = 'Speaker not found. Retrying...';
+        setTimeout(connectToSpeaker, 3000);
+      });
+    }
+
+    // Also accept incoming connections from speaker
+    peer.on('connection', (incoming) => {
+      conn = incoming;
+      conn.on('open', () => {
+        statusEl.textContent = 'Connected to speaker!';
+        btn.style.borderColor = '#00ff88';
+      });
+      conn.on('data', (data) => {
+        if (data.type === 'transcript') transcriptEl.textContent = '"' + data.text + '"';
+        else if (data.type === 'response') responseEl.textContent = data.text;
+        else if (data.type === 'status') statusEl.textContent = data.text;
+      });
+    });
+
+    // Mic setup
+    async function setupMic() {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+      const ctx = new AudioContext();
+      const src = ctx.createMediaStreamSource(stream);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+    }
+
+    function updateLevel() {
+      if (!analyser) return;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      levelBar.style.width = Math.min(100, avg * 1.5) + '%';
+      if (isRecording) animFrame = requestAnimationFrame(updateLevel);
+    }
+
+    function startRecording() {
+      if (!stream) return;
+      isRecording = true;
+      audioChunks = [];
+      btn.classList.add('listening');
+      btn.textContent = 'Listening...';
+      transcriptEl.textContent = '';
+      responseEl.textContent = '';
+
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.onstop = sendAudio;
+      mediaRecorder.start(100); // chunks every 100ms
+      updateLevel();
+    }
+
+    function stopRecording() {
+      if (!isRecording) return;
+      isRecording = false;
+      btn.classList.remove('listening');
+      btn.classList.add('processing');
+      btn.textContent = 'Processing...';
+      cancelAnimationFrame(animFrame);
+      levelBar.style.width = '0%';
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    }
+
+    async function sendAudio() {
+      const blob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
+      // Convert to base64 and send via PeerJS data channel
+      const buffer = await blob.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+
+      if (conn && conn.open) {
+        conn.send({ type: 'audio', data: base64, format: 'webm-opus' });
+        statusEl.textContent = 'Audio sent to speaker...';
+      } else {
+        statusEl.textContent = 'Not connected to speaker!';
+      }
+
+      btn.classList.remove('processing');
+      btn.textContent = 'Tap to talk';
+    }
+
+    // Button handlers (touch + mouse)
+    btn.addEventListener('mousedown', (e) => { e.preventDefault(); startRecording(); });
+    btn.addEventListener('mouseup', (e) => { e.preventDefault(); stopRecording(); });
+    btn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+    btn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+
+    // Init mic on first interaction
+    let micReady = false;
+    btn.addEventListener('click', async () => {
+      if (!micReady) {
+        await setupMic();
+        micReady = true;
+        statusEl.textContent = conn && conn.open ? 'Connected! Hold button to talk.' : 'Mic ready. Waiting for speaker...';
+      }
+    }, { once: true });
+  </script>
+</body>
+</html>
