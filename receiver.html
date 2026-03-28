@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HK AI Assistant - Cast Receiver</title>
+  <style>
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+    #status {
+      font-size: 24px;
+      margin: 20px;
+      text-align: center;
+    }
+    #log {
+      font-size: 14px;
+      font-family: monospace;
+      background: #0f0f23;
+      padding: 20px;
+      border-radius: 10px;
+      max-width: 80%;
+      max-height: 60vh;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+    .success { color: #00ff88; }
+    .error { color: #ff4444; }
+    .info { color: #44aaff; }
+    .warn { color: #ffaa00; }
+  </style>
+</head>
+<body>
+  <h1>HK AI Assistant</h1>
+  <div id="status">Initializing...</div>
+  <div id="log"></div>
+
+  <!-- Google Cast Receiver SDK -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+
+    function log(msg, cls = 'info') {
+      const ts = new Date().toLocaleTimeString();
+      logEl.innerHTML += `<span class="${cls}">[${ts}] ${msg}</span>\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    // ===== Phase 1: Diagnostics =====
+    async function runDiagnostics() {
+      log('=== DEVICE DIAGNOSTICS ===', 'info');
+
+      // 1. Check getUserMedia support
+      log('Checking getUserMedia support...');
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        log('getUserMedia API: AVAILABLE', 'success');
+      } else {
+        log('getUserMedia API: NOT AVAILABLE', 'error');
+      }
+
+      // 2. Check enumerateDevices
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        log(`Found ${devices.length} media devices:`, 'info');
+        devices.forEach((d, i) => {
+          log(`  [${i}] ${d.kind}: ${d.label || '(no label)'} (id: ${d.deviceId.slice(0, 8)}...)`, 'info');
+        });
+
+        const audioInputs = devices.filter(d => d.kind === 'audioinput');
+        if (audioInputs.length > 0) {
+          log(`MICROPHONES FOUND: ${audioInputs.length}`, 'success');
+        } else {
+          log('NO MICROPHONES FOUND', 'error');
+        }
+      } catch (e) {
+        log(`enumerateDevices error: ${e.message}`, 'error');
+      }
+
+      // 3. Try to access the microphone
+      log('');
+      log('=== MICROPHONE ACCESS TEST ===', 'info');
+      try {
+        setStatus('Requesting microphone access...');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 16000
+          }
+        });
+        log('MICROPHONE ACCESS GRANTED!', 'success');
+
+        const tracks = stream.getAudioTracks();
+        tracks.forEach((t, i) => {
+          log(`  Track ${i}: ${t.label}, enabled=${t.enabled}, muted=${t.muted}`, 'success');
+          const settings = t.getSettings();
+          log(`  Settings: sampleRate=${settings.sampleRate}, channelCount=${settings.channelCount}`, 'info');
+        });
+
+        // 4. Test audio level detection
+        log('');
+        log('=== AUDIO LEVEL TEST (5 seconds) ===', 'info');
+        setStatus('Listening for audio... speak now!');
+
+        const audioCtx = new AudioContext();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let maxLevel = 0;
+        let samples = 0;
+
+        const checkLevel = setInterval(() => {
+          analyser.getByteFrequencyData(dataArray);
+          const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+          if (avg > maxLevel) maxLevel = avg;
+          samples++;
+
+          const bar = '█'.repeat(Math.floor(avg / 5)) + '░'.repeat(Math.floor((255 - avg) / 5));
+          log(`  Level: ${avg.toFixed(1)} ${bar.slice(0, 40)}`, avg > 10 ? 'success' : 'info');
+        }, 500);
+
+        setTimeout(() => {
+          clearInterval(checkLevel);
+          stream.getTracks().forEach(t => t.stop());
+          audioCtx.close();
+
+          log('');
+          if (maxLevel > 10) {
+            log(`MIC IS WORKING! Max level: ${maxLevel.toFixed(1)}`, 'success');
+            setStatus('MICROPHONE WORKS! Ready for AI assistant.');
+          } else {
+            log(`Max level: ${maxLevel.toFixed(1)} - mic may be muted or not picking up sound`, 'warn');
+            setStatus('Mic accessible but low signal. Check if muted.');
+          }
+
+          log('');
+          log('=== NETWORK TEST ===', 'info');
+          testNetwork();
+        }, 5000);
+
+      } catch (e) {
+        log(`MICROPHONE ACCESS DENIED: ${e.name} - ${e.message}`, 'error');
+        setStatus('Mic access denied. See log for details.');
+
+        if (e.name === 'NotAllowedError') {
+          log('The device/browser denied microphone access.', 'error');
+          log('This may be a Cast receiver limitation.', 'warn');
+        } else if (e.name === 'NotFoundError') {
+          log('No microphone hardware found on this device.', 'error');
+        } else if (e.name === 'NotReadableError') {
+          log('Microphone exists but cannot be read (hardware error or in use).', 'error');
+        }
+
+        testNetwork();
+      }
+    }
+
+    // 5. Test network connectivity (can we reach Claude API?)
+    async function testNetwork() {
+      log('Testing network connectivity...');
+
+      try {
+        const r = await fetch('https://api.anthropic.com/', { method: 'HEAD', mode: 'no-cors' });
+        log('Anthropic API: reachable (no-cors)', 'success');
+      } catch (e) {
+        log(`Anthropic API: ${e.message}`, 'warn');
+      }
+
+      try {
+        const r = await fetch('https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=test', { mode: 'no-cors' });
+        log('Google TTS: reachable', 'success');
+      } catch (e) {
+        log(`Google TTS: ${e.message}`, 'warn');
+      }
+
+      // Web Audio API test
+      log('');
+      log('=== AUDIO OUTPUT TEST ===', 'info');
+      try {
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        gain.gain.value = 0.1;
+        osc.frequency.value = 440;
+        osc.start();
+        log('Playing 440Hz test tone for 2 seconds...', 'info');
+        setStatus('Playing test tone...');
+
+        setTimeout(() => {
+          osc.stop();
+          ctx.close();
+          log('Audio output test complete', 'success');
+          setStatus('All diagnostics complete. Check log.');
+
+          log('');
+          log('=== SUMMARY ===', 'info');
+          log('Diagnostics complete. Share these results to plan next steps.', 'info');
+        }, 2000);
+      } catch (e) {
+        log(`Audio output error: ${e.message}`, 'error');
+      }
+    }
+
+    // ===== Initialize Cast Receiver =====
+    function initCast() {
+      try {
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout = true;  // Don't timeout
+
+        context.addEventListener(cast.framework.system.EventType.READY, () => {
+          log('Cast Receiver: READY', 'success');
+          runDiagnostics();
+        });
+
+        context.addEventListener(cast.framework.system.EventType.ERROR, (e) => {
+          log(`Cast error: ${JSON.stringify(e)}`, 'error');
+        });
+
+        context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, (e) => {
+          log('Sender connected', 'success');
+        });
+
+        context.start(options);
+        log('Cast Receiver SDK initialized', 'info');
+      } catch (e) {
+        log(`Cast SDK init error: ${e.message}. Running standalone.`, 'warn');
+        // Run diagnostics anyway even without Cast SDK
+        runDiagnostics();
+      }
+    }
+
+    // Start
+    window.addEventListener('load', () => {
+      log('HK AI Assistant - Diagnostic Mode', 'info');
+      log(`UserAgent: ${navigator.userAgent}`, 'info');
+      log(`Platform: ${navigator.platform}`, 'info');
+      log('');
+
+      // Wait for Cast SDK to load, or timeout
+      if (typeof cast !== 'undefined' && cast.framework) {
+        initCast();
+      } else {
+        log('Waiting for Cast SDK...', 'info');
+        setTimeout(() => {
+          if (typeof cast !== 'undefined' && cast.framework) {
+            initCast();
+          } else {
+            log('Cast SDK not loaded. Running diagnostics standalone.', 'warn');
+            runDiagnostics();
+          }
+        }, 3000);
+      }
+    });
+  </script>
+</body>
+</html>
